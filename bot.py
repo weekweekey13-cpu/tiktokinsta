@@ -208,7 +208,7 @@ def load_cache() -> dict[str, Any]:
 
 def cache_key(platform: str, media_id: str) -> str:
     if platform == "tiktok":
-        return f"tiktok:nwm6:{media_id}"
+        return f"tiktok:nwm7:{media_id}"
     return f"{platform}:{media_id}"
 
 
@@ -1837,18 +1837,155 @@ def probe_video(path: Path) -> dict[str, Any]:
         duration = float(video.get("duration") or fmt.get("duration") or 0)
     except (TypeError, ValueError):
         duration = 0
+    try:
+        abitrate = int(audio.get("bit_rate") or fmt.get("bit_rate") or 0)
+    except (TypeError, ValueError):
+        abitrate = 0
+    try:
+        asamplerate = int(audio.get("sample_rate") or 0)
+    except (TypeError, ValueError):
+        asamplerate = 0
+    try:
+        achannels = int(audio.get("channels") or 0)
+    except (TypeError, ValueError):
+        achannels = 0
     return {
         "width": int(video.get("width") or 0),
         "height": int(video.get("height") or 0),
         "duration": int(duration or 0),
         "vcodec": str(video.get("codec_name") or ""),
         "acodec": str(audio.get("codec_name") or ""),
+        "abitrate": abitrate,
+        "asamplerate": asamplerate,
+        "achannels": achannels,
     }
 
 
 def _run_ffmpeg(cmd: list[str], timeout: int = 300) -> bool:
     proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
     return proc.returncode == 0
+
+
+def mux_original_audio(video_path: Path, audio_src: Path, dest: Path) -> Path | None:
+    """Видео из первого файла, звук из второго. Сначала copy, иначе AAC 320k."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    dest.unlink(missing_ok=True)
+    copy_cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-i",
+        str(audio_src),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(dest),
+    ]
+    if _run_ffmpeg(copy_cmd, 120) and dest.exists() and dest.stat().st_size >= 2000:
+        return dest
+    dest.unlink(missing_ok=True)
+    aac_cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-i",
+        str(audio_src),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "320k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(dest),
+    ]
+    if _run_ffmpeg(aac_cmd, 180) and dest.exists() and dest.stat().st_size >= 2000:
+        return dest
+    dest.unlink(missing_ok=True)
+    return None
+
+
+def pick_original_audio_video(
+    play_url: str,
+    hd_url: str,
+    workdir: Path,
+    progress: DownloadProgress | None = None,
+    extra_headers: dict | None = None,
+) -> Path | None:
+    """
+    play — оригинал без водяного знака и с родным звуком.
+    hdplay — часто пережатый «HD» с хуже звуком. Берём его видео только если оно реально больше,
+    и тогда подклеиваем звук из play без перекодирования.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    play_path = workdir / "orig.bin"
+    hd_path = workdir / "hd.bin"
+    if play_url:
+        try:
+            if progress:
+                progress.set("download", 18)
+            download_remote_video(play_url, play_path, progress=progress, extra_headers=extra_headers)
+        except Exception as e:
+            log.warning("orig play: %s", e)
+            play_path.unlink(missing_ok=True)
+    if not play_path.exists() and hd_url:
+        try:
+            download_remote_video(hd_url, hd_path, progress=progress, extra_headers=extra_headers)
+        except Exception as e:
+            log.warning("hdplay fallback: %s", e)
+            hd_path.unlink(missing_ok=True)
+        return hd_path if hd_path.exists() else None
+    if not play_path.exists():
+        return None
+    play_probe = probe_video(play_path)
+    play_h = max(int(play_probe.get("height") or 0), int(play_probe.get("width") or 0))
+    if not hd_url or play_h >= 720:
+        return play_path
+    try:
+        if progress:
+            progress.set("download", 40)
+        download_remote_video(hd_url, hd_path, progress=progress, extra_headers=extra_headers)
+    except Exception as e:
+        log.warning("hdplay extra: %s", e)
+        hd_path.unlink(missing_ok=True)
+        return play_path
+    hd_probe = probe_video(hd_path)
+    hd_h = max(int(hd_probe.get("height") or 0), int(hd_probe.get("width") or 0))
+    if hd_h <= play_h + 16:
+        hd_path.unlink(missing_ok=True)
+        return play_path
+    if not play_probe.get("acodec"):
+        return hd_path
+    merged = mux_original_audio(hd_path, play_path, workdir / "merged.mp4")
+    return merged or play_path
 
 
 def prepare_telegram_video(src: Path, workdir: Path, progress: DownloadProgress | None = None) -> Path:
@@ -1939,7 +2076,11 @@ def prepare_telegram_video(src: Path, workdir: Path, progress: DownloadProgress 
         "-c:a",
         "aac",
         "-b:a",
-        "256k",
+        "320k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
         "-movflags",
         "+faststart",
         str(dest),
@@ -2011,7 +2152,11 @@ def fit_telegram_limit(src: Path, workdir: Path, progress: DownloadProgress | No
         "-c:a",
         "aac",
         "-b:a",
-        "160k",
+        "320k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
         "-movflags",
         "+faststart",
         str(dest),
@@ -2472,25 +2617,15 @@ def download_via_tikwm(
     play = info.get("play") or data.get("play")
     wmplay = info.get("wmplay") or data.get("wmplay") or ""
     aweme_id = str(info.get("id") or media_id_from_url(url, "tiktok") or "")
-    candidates: list[str] = []
-    # hdplay и play у tikwm — без водяного знака. wmplay — с логотипом, не трогаем.
-    if hdplay and not looks_watermarked(str(hdplay), str(wmplay)):
-        candidates.append(str(hdplay))
-    if play and not looks_watermarked(str(play), str(wmplay)):
-        candidates.append(str(play))
+    play_url = str(play) if play and not looks_watermarked(str(play), str(wmplay)) else ""
+    hd_url = str(hdplay) if hdplay and not looks_watermarked(str(hdplay), str(wmplay)) else ""
     if aweme_id.isdigit():
-        candidates.append(f"https://www.tikwm.com/video/media/hdplay/{aweme_id}.mp4")
-        if not no_watermark_only:
-            candidates.append(f"https://www.tikwm.com/video/media/play/{aweme_id}.mp4")
-    seen: set[str] = set()
-    unique: list[str] = []
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            unique.append(c)
-    candidates = unique
-    if not candidates:
-        log.warning("tikwm нет ролика без водяного знака: %s", data.get("msg") or "no hdplay")
+        if not play_url:
+            play_url = f"https://www.tikwm.com/video/media/play/{aweme_id}.mp4"
+        if not hd_url:
+            hd_url = f"https://www.tikwm.com/video/media/hdplay/{aweme_id}.mp4"
+    if not play_url and not hd_url:
+        log.warning("tikwm нет ролика без водяного знака: %s", data.get("msg") or "no play")
         return None
     title = (info.get("title") or "TikTok").strip()
     author_info = info.get("author") if isinstance(info.get("author"), dict) else {}
@@ -2498,26 +2633,15 @@ def download_via_tikwm(
     if progress:
         progress.set("download", 15, title)
     workdir.mkdir(parents=True, exist_ok=True)
-    dest = workdir / "tikwm.mp4"
-    last_dl = None
-    got_url = None
-    for video_url in candidates:
-        try:
-            download_remote_video(
-                str(video_url),
-                dest,
-                progress=progress,
-                extra_headers={"Referer": "https://www.tikwm.com/"},
-            )
-            got_url = video_url
-            break
-        except Exception as e:
-            last_dl = e
-            dest.unlink(missing_ok=True)
-            log.warning("tikwm download %s: %s", str(video_url)[:80], e)
-    if not got_url or not dest.exists():
-        if last_dl:
-            log.warning("tikwm все ссылки не скачались: %s", last_dl)
+    dest = pick_original_audio_video(
+        play_url,
+        hd_url,
+        workdir,
+        progress=progress,
+        extra_headers={"Referer": "https://www.tikwm.com/"},
+    )
+    if not dest or not dest.exists():
+        log.warning("tikwm: не скачался оригинал")
         return None
     duration = int(info.get("duration") or 0)
     if duration and duration > MAX_DURATION_SEC:
@@ -2561,32 +2685,30 @@ def download_via_tikmate(url: str, workdir: Path, progress: DownloadProgress | N
     if not token or not aweme_id.isdigit():
         log.warning("tikmate: нет token/id")
         return None
-    candidates = [
-        f"https://tikmate.app/download/{token}/{aweme_id}.mp4?hd=1",
-        f"https://api.tikmate.app/download/{token}/{aweme_id}.mp4?hd=1",
-        f"https://tikmate.app/download/{token}/{aweme_id}.mp4",
-    ]
+    orig_url = f"https://tikmate.app/download/{token}/{aweme_id}.mp4"
+    hd_url = f"https://tikmate.app/download/{token}/{aweme_id}.mp4?hd=1"
     workdir.mkdir(parents=True, exist_ok=True)
-    dest = workdir / "tikmate.bin"
-    last_err = None
     if progress:
         progress.set("download", 18, str(data.get("desc") or "TikTok")[:40])
-    for video_url in candidates:
+    dest = pick_original_audio_video(
+        orig_url,
+        hd_url,
+        workdir,
+        progress=progress,
+        extra_headers={"Referer": "https://tikmate.app/"},
+    )
+    if not dest or not dest.exists():
         try:
+            dest = workdir / "tikmate.bin"
             download_remote_video(
-                video_url,
+                f"https://api.tikmate.app/download/{token}/{aweme_id}.mp4",
                 dest,
                 progress=progress,
                 extra_headers={"Referer": "https://tikmate.app/"},
             )
-            last_err = None
-            break
         except Exception as e:
-            last_err = e
-            dest.unlink(missing_ok=True)
             log.warning("tikmate download: %s", e)
-    if last_err or not dest.exists():
-        return None
+            return None
     video = prepare_telegram_video(dest, workdir, progress)
     return result_from_file(
         video,
@@ -2611,6 +2733,8 @@ def download_via_tikwm_direct(url: str, workdir: Path, progress: DownloadProgres
     dest = workdir / "tikwm_direct.mp4"
     last_err = None
     for video_url in (
+        f"https://www.tikwm.com/video/media/play/{aweme_id}.mp4",
+        f"https://tikwm.com/video/media/play/{aweme_id}.mp4",
         f"https://www.tikwm.com/video/media/hdplay/{aweme_id}.mp4",
         f"https://tikwm.com/video/media/hdplay/{aweme_id}.mp4",
     ):
@@ -3249,7 +3373,10 @@ def attach_tiktok_audio(
 ) -> dict[str, Any]:
     path = Path(result["path"])
     probe = probe_video(path)
-    if probe.get("acodec"):
+    # Родной звук уже есть — не подменяем его треком из music (это часто только песня без голоса).
+    if probe.get("acodec") and int(probe.get("abitrate") or 0) >= 64_000:
+        return result
+    if probe.get("acodec") and not probe.get("abitrate"):
         return result
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -3262,39 +3389,16 @@ def attach_tiktok_audio(
             timeout=20,
         )
         info = data.get("data") if isinstance(data.get("data"), dict) else {}
-        music = info.get("music") or (info.get("music_info") or {}).get("play")
-        if not music:
+        # play — микс ролика (голос+эффекты+музыка). music — только исходный трек.
+        audio_src = info.get("play") or info.get("music") or (info.get("music_info") or {}).get("play")
+        if not audio_src:
             return result
         if progress:
             progress.set("convert", 90)
-        audio_path = workdir / "music.bin"
-        download_remote_video(str(music), audio_path, extra_headers={"Referer": "https://www.tikwm.com/"})
-        dest = workdir / "with_audio.mp4"
-        ok = _run_ffmpeg(
-            [
-                ffmpeg,
-                "-y",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                str(path),
-                "-i",
-                str(audio_path),
-                "-c:v",
-                "copy",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "256k",
-                "-shortest",
-                "-movflags",
-                "+faststart",
-                str(dest),
-            ],
-            180,
-        )
-        if ok and dest.exists() and dest.stat().st_size >= 2000:
+        audio_path = workdir / "orig_audio.bin"
+        download_remote_video(str(audio_src), audio_path, extra_headers={"Referer": "https://www.tikwm.com/"})
+        dest = mux_original_audio(path, audio_path, workdir / "with_audio.mp4")
+        if dest:
             result["path"] = dest
             result.update({k: v for k, v in probe_video(dest).items() if k in {"width", "height", "duration"}})
     except Exception as e:
