@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
-from urllib.request import Request, urlopen
+from http.cookiejar import CookieJar
+from urllib.request import HTTPCookieProcessor, Request, build_opener, urlopen
 
 from dotenv import load_dotenv
 from telegram import (
@@ -206,6 +207,8 @@ def load_cache() -> dict[str, Any]:
 
 
 def cache_key(platform: str, media_id: str) -> str:
+    if platform == "tiktok":
+        return f"tiktok:nwm4:{media_id}"
     return f"{platform}:{media_id}"
 
 
@@ -2080,9 +2083,24 @@ def http_text(
         return resp.read().decode("utf-8", "replace")
 
 
-def looks_watermarked(url: str) -> bool:
-    low = (url or "").lower()
-    return any(s in low for s in ("wmplay", "watermark", "with_watermark", "playwm", "/wm/"))
+def looks_watermarked(url: str, wmplay: str = "") -> bool:
+    if not url:
+        return True
+    low = url.lower()
+    if wmplay and url == wmplay:
+        return True
+    return any(
+        s in low
+        for s in (
+            "wmplay",
+            "watermark=1",
+            "with_watermark",
+            "playwm",
+            "/wmplay/",
+            "/wm/",
+            "use_wm",
+        )
+    )
 
 
 def decode_snap_app(args: list[str]) -> str:
@@ -2187,7 +2205,13 @@ def download_remote_video(
         raise first
 
 
-def download_via_tikwm(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
+def download_via_tikwm(
+    url: str,
+    workdir: Path,
+    progress: DownloadProgress | None = None,
+    *,
+    no_watermark_only: bool = False,
+) -> dict[str, Any] | None:
     if progress:
         progress.set("start", 8)
     api = "https://www.tikwm.com/api/?hd=1&url=" + quote(url, safe="")
@@ -2197,15 +2221,19 @@ def download_via_tikwm(url: str, workdir: Path, progress: DownloadProgress | Non
         log.warning("tikwm: %s", e)
         return None
     info = data.get("data") if isinstance(data.get("data"), dict) else {}
-    candidates = [
-        info.get("hdplay"),
-        data.get("hdplay"),
-        info.get("play"),
-        data.get("play"),
-    ]
-    video_url = next((u for u in candidates if u and not looks_watermarked(str(u))), None)
-    if not video_url:
-        log.warning("tikwm отказ: %s", data.get("msg") or data)
+    hdplay = info.get("hdplay") or data.get("hdplay")
+    play = info.get("play") or data.get("play")
+    wmplay = info.get("wmplay") or data.get("wmplay") or ""
+    aweme_id = str(info.get("id") or media_id_from_url(url, "tiktok") or "")
+    candidates: list[str] = []
+    if hdplay and not looks_watermarked(str(hdplay), str(wmplay)):
+        candidates.append(str(hdplay))
+    if aweme_id and no_watermark_only:
+        candidates.append(f"https://www.tikwm.com/video/media/hdplay/{aweme_id}.mp4")
+    if not no_watermark_only and play and not looks_watermarked(str(play), str(wmplay)):
+        candidates.append(str(play))
+    if not candidates:
+        log.warning("tikwm нет ролика без водяного знака: %s", data.get("msg") or "no hdplay")
         return None
     title = (info.get("title") or "TikTok").strip()
     author_info = info.get("author") if isinstance(info.get("author"), dict) else {}
@@ -2214,7 +2242,26 @@ def download_via_tikwm(url: str, workdir: Path, progress: DownloadProgress | Non
         progress.set("download", 15, title)
     workdir.mkdir(parents=True, exist_ok=True)
     dest = workdir / "tikwm.mp4"
-    download_remote_video(str(video_url), dest, progress=progress, extra_headers={"Referer": "https://www.tikwm.com/"})
+    last_dl = None
+    got_url = None
+    for video_url in candidates:
+        try:
+            download_remote_video(
+                str(video_url),
+                dest,
+                progress=progress,
+                extra_headers={"Referer": "https://www.tikwm.com/"},
+            )
+            got_url = video_url
+            break
+        except Exception as e:
+            last_dl = e
+            dest.unlink(missing_ok=True)
+            log.warning("tikwm download %s: %s", str(video_url)[:80], e)
+    if not got_url or not dest.exists():
+        if last_dl:
+            log.warning("tikwm все ссылки не скачались: %s", last_dl)
+        return None
     duration = int(info.get("duration") or 0)
     if duration and duration > MAX_DURATION_SEC:
         dest.unlink(missing_ok=True)
@@ -2229,6 +2276,235 @@ def download_via_tikwm(url: str, workdir: Path, progress: DownloadProgress | Non
         media_id=str(info.get("id") or media_id_from_url(url, platform)),
         webpage_url=url,
         duration=duration,
+    )
+
+
+def download_via_tikwm_direct(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
+    aweme_id = media_id_from_url(url, "tiktok")
+    if not aweme_id.isdigit():
+        resolved = resolve_redirect(url)
+        aweme_id = media_id_from_url(resolved, "tiktok")
+    if not aweme_id.isdigit():
+        return None
+    if progress:
+        progress.set("start", 9)
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / "tikwm_direct.mp4"
+    last_err = None
+    for video_url in (
+        f"https://www.tikwm.com/video/media/hdplay/{aweme_id}.mp4",
+        f"https://tikwm.com/video/media/hdplay/{aweme_id}.mp4",
+    ):
+        try:
+            download_remote_video(
+                video_url,
+                dest,
+                progress=progress,
+                extra_headers={"Referer": "https://www.tikwm.com/"},
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            dest.unlink(missing_ok=True)
+    if last_err or not dest.exists():
+        log.warning("tikwm-direct: %s", last_err)
+        return None
+    video = prepare_telegram_video(dest, workdir, progress)
+    return result_from_file(
+        video,
+        title="TikTok",
+        author="TikTok",
+        platform="tiktok",
+        media_id=aweme_id,
+        webpage_url=url,
+    )
+
+
+def download_via_ssstik(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
+    """ssstik.io отдаёт перекодированный файл без водяного знака."""
+    if progress:
+        progress.set("start", 9)
+    opener = build_opener(HTTPCookieProcessor(CookieJar()))
+    try:
+        home_req = Request(
+            "https://ssstik.io/en",
+            headers={"User-Agent": HTTP_UA, "Accept": "text/html"},
+        )
+        home = opener.open(home_req, timeout=20).read().decode("utf-8", "replace")
+        tt_m = re.search(r"s_tt\s*=\s*'([^']+)'", home) or re.search(r"tt['\"]?\s*[:=]\s*['\"]([^'\"]+)", home)
+        tt = tt_m.group(1) if tt_m else "UlRHZ000"
+        body = urlencode({"id": url, "locale": "en", "tt": tt}).encode("utf-8")
+        post_req = Request(
+            "https://ssstik.io/abc?url=dl",
+            data=body,
+            headers={
+                "User-Agent": HTTP_UA,
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": "https://ssstik.io",
+                "Referer": "https://ssstik.io/en",
+                "HX-Request": "true",
+                "HX-Target": "target",
+                "HX-Current-URL": "https://ssstik.io/en",
+                "Accept": "*/*",
+            },
+        )
+        html = opener.open(post_req, timeout=35).read().decode("utf-8", "replace")
+    except Exception as e:
+        log.warning("ssstik: %s", e)
+        return None
+
+    scored: list[tuple[int, str]] = []
+    for m in re.finditer(r'<a\b([^>]*)>', html, re.IGNORECASE):
+        attrs = m.group(1)
+        href = re.search(r'href="(https?://[^"]+)"', attrs)
+        if not href:
+            continue
+        link = href.group(1)
+        low = (attrs + " " + link).lower()
+        if looks_watermarked(link) or "play.google.com" in low:
+            continue
+        score = 0
+        if "without_watermark_hd" in low or "quality-best" in low:
+            score += 300
+        if "without_watermark" in low:
+            score += 200
+        if "tikcdn.io/ssstik/" in low and "/m/" not in low:
+            score += 150
+        if "tikcdn.io" in low:
+            score += 80
+        if score:
+            scored.append((score, link))
+    if not scored:
+        for link in re.findall(r'href="(https?://tikcdn\.io/ssstik/[^"]+)"', html):
+            if "/m/" not in link:
+                scored.append((100, link))
+    if not scored:
+        log.warning("ssstik: нет ссылки без водяного знака")
+        return None
+    scored.sort(reverse=True)
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / "ssstik.bin"
+    last_err = None
+    for _score, video_url in scored[:3]:
+        try:
+            if progress:
+                progress.set("download", 20)
+            download_remote_video(
+                video_url,
+                dest,
+                progress=progress,
+                extra_headers={"Referer": "https://ssstik.io/"},
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            dest.unlink(missing_ok=True)
+    if last_err or not dest.exists():
+        log.warning("ssstik download: %s", last_err)
+        return None
+    video = prepare_telegram_video(dest, workdir, progress)
+    title_m = re.search(r'<p class="maintext">([^<]+)', html)
+    author_m = re.search(r"<h2>([^<]+)</h2>", html)
+    return result_from_file(
+        video,
+        title=(title_m.group(1).strip() if title_m else "TikTok"),
+        author=(author_m.group(1).strip() if author_m else "TikTok"),
+        platform="tiktok",
+        media_id=media_id_from_url(url, "tiktok"),
+        webpage_url=url,
+    )
+
+
+def download_via_snaptik(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
+    if progress:
+        progress.set("start", 10)
+    try:
+        from Cryptodome.Cipher import AES
+    except ImportError:
+        try:
+            from Crypto.Cipher import AES  # type: ignore
+        except ImportError:
+            log.warning("snaptik: нет AES")
+            return None
+    import base64
+    import hashlib
+
+    def solve(ch: dict[str, Any]) -> int:
+        typ = ch.get("t")
+        if typ == "b":
+            return ((int(ch["a"]) ^ int(ch["b"])) >> int(ch["s"])) & 255
+        if typ == "r":
+            return sum(int(x) for x in ch["n"]) * 2 + 1
+        if typ == "c":
+            return ord(str(ch["w"])[int(ch["i"])]) * int(ch["m"])
+        if typ == "m":
+            return ((int(ch["a"]) + int(ch["b"])) % 100) * int(ch["c"])
+        if typ == "n":
+            a, b, c = int(ch["a"]), int(ch["b"]), int(ch["c"])
+            return a * b + b * c + c * a - a
+        raise RuntimeError(f"unknown challenge {typ}")
+
+    try:
+        token = http_json(
+            "POST",
+            "https://snaptik.app/api/token",
+            {},
+            {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=20,
+        )
+        tid = str(token.get("id") or "")
+        payload = str(token.get("p") or "")
+        if not tid or not payload:
+            return None
+        key = hashlib.sha256(f"sn4pt1k_v3r1fy2026:{tid}".encode("utf-8")).digest()
+        blob = base64.b64decode(payload)
+        pt = AES.new(key, AES.MODE_CBC, blob[:16]).decrypt(blob[16:])
+        pad = pt[-1]
+        if 1 <= pad <= 16:
+            pt = pt[:-pad]
+        challenge = json.loads(pt.decode("utf-8"))
+        verify = f"{tid}:{solve(challenge)}:{challenge['_e']}:{challenge['_h']}"
+        raw = http_text(
+            "GET",
+            "https://snaptik.app/api/extract?url=" + quote(url, safe=""),
+            headers={
+                "Accept": "application/json",
+                "X-Requested-With": "XMLHttpRequest",
+                "X-Verify": verify,
+            },
+            timeout=25,
+        )
+        data = json.loads(raw)
+    except Exception as e:
+        log.warning("snaptik: %s", e)
+        return None
+    info = data.get("data") if isinstance(data.get("data"), dict) else {}
+    video_url = info.get("downloadUrl") or info.get("url")
+    if not video_url or looks_watermarked(str(video_url)):
+        return None
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / "snaptik.bin"
+    if progress:
+        progress.set("download", 22)
+    try:
+        download_remote_video(str(video_url), dest, progress=progress, extra_headers={"Referer": "https://snaptik.app/"})
+    except Exception as e:
+        log.warning("snaptik download: %s", e)
+        return None
+    video = prepare_telegram_video(dest, workdir, progress)
+    return result_from_file(
+        video,
+        title=str(info.get("title") or "TikTok"),
+        author="TikTok",
+        platform="tiktok",
+        media_id=str(info.get("id") or media_id_from_url(url, "tiktok")),
+        webpage_url=url,
     )
 
 
@@ -2356,7 +2632,7 @@ def download_via_ytdlp(
 
     outtmpl = str(workdir / "ytdlp.%(ext)s")
     if platform == "tiktok":
-        fmt = "download/download_addr/h264_720p_1/h264_540p_1/bestvideo*[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best"
+        fmt = "download/download_addr"
     else:
         fmt = "bestvideo*+bestaudio/best"
     opts: dict[str, Any] = {
@@ -2452,8 +2728,10 @@ def download_video(url: str, platform: str, workdir: Path, progress: DownloadPro
     last_err = ""
     backends: list[tuple[str, Any]] = []
     if platform == "tiktok":
-        backends.append(("tikwm", lambda: download_via_tikwm(url, workdir / "tikwm", progress)))
-        backends.append(("snapsave", lambda: download_via_snapsave(url, workdir / "snapsave", progress)))
+        backends.append(
+            ("tikwm", lambda: download_via_tikwm(url, workdir / "tikwm", progress, no_watermark_only=True))
+        )
+        backends.append(("tikwm-direct", lambda: download_via_tikwm_direct(url, workdir / "tikwm_direct", progress)))
         backends.append(("yt-dlp", lambda: download_via_ytdlp(url, platform, workdir / "ytdlp", progress)))
     else:
         backends.append(("snapsave", lambda: download_via_snapsave(url, workdir / "snapsave", progress)))
