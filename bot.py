@@ -208,7 +208,7 @@ def load_cache() -> dict[str, Any]:
 
 def cache_key(platform: str, media_id: str) -> str:
     if platform == "tiktok":
-        return f"tiktok:nwm5:{media_id}"
+        return f"tiktok:nwm6:{media_id}"
     return f"{platform}:{media_id}"
 
 
@@ -2208,6 +2208,240 @@ def download_remote_video(
         raise first
 
 
+def _session_download(
+    opener,
+    video_url: str,
+    dest: Path,
+    progress: DownloadProgress | None = None,
+    extra_headers: dict | None = None,
+    timeout: int = 90,
+) -> None:
+    hdrs = {
+        "User-Agent": HTTP_UA,
+        "Accept": "*/*",
+        "Referer": "https://www.tiktok.com/",
+    }
+    if extra_headers:
+        hdrs.update(extra_headers)
+    req = Request(video_url, headers=hdrs)
+    limit = MAX_DOWNLOAD_MB * 1024 * 1024
+    with opener.open(req, timeout=timeout) as resp, dest.open("wb") as out:
+        total = 0
+        try:
+            total = int(resp.headers.get("Content-Length") or 0)
+        except ValueError:
+            total = 0
+        n = 0
+        last_pct = -1
+        while True:
+            chunk = resp.read(256 * 1024)
+            if not chunk:
+                break
+            n += len(chunk)
+            if n > limit:
+                dest.unlink(missing_ok=True)
+                raise RuntimeError(f"Файл слишком большой. Лимит Telegram — {MAX_FILE_MB} МБ.")
+            out.write(chunk)
+            if progress:
+                if total > 0:
+                    pct = 20 + int(70 * n / total)
+                else:
+                    pct = min(90, 20 + n // 400_000)
+                if pct != last_pct:
+                    progress.set("download", pct)
+                    last_pct = pct
+    if not dest.exists() or dest.stat().st_size < 2000:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError("Пустой файл, источник не отдал видео.")
+    if progress:
+        progress.set("download", 92)
+
+
+def _tiktok_nowm_candidates(video: dict[str, Any]) -> list[str]:
+    """playAddr / bitrateInfo — без водяного знака. downloadAddr — с логотипом, не берём."""
+    scored: list[tuple[int, str]] = []
+
+    def add(url: Any, width: Any = 0, height: Any = 0, size: Any = 0, codec: str = "") -> None:
+        if not url or not isinstance(url, str) or not url.startswith("http"):
+            return
+        host = (urlparse(url).hostname or "").lower()
+        if host in {"www.tiktok.com", "tiktok.com"}:
+            return
+        if looks_watermarked(url):
+            return
+        codec_l = (codec or "").lower()
+        if "bytevc2" in codec_l:
+            return
+        try:
+            w = int(width or 0)
+            h = int(height or 0)
+            sz = int(size or 0)
+        except (TypeError, ValueError):
+            w = h = sz = 0
+        h264 = 0 if any(x in codec_l for x in ("h265", "hevc", "bytevc1")) else 10_000_000
+        scored.append((h264 + max(w, h) * 10_000 + sz // 50_000, url))
+
+    for item in video.get("bitrateInfo") or video.get("bit_rate") or []:
+        if not isinstance(item, dict):
+            continue
+        play = item.get("PlayAddr") or item.get("playAddr") or item.get("play_addr") or {}
+        if not isinstance(play, dict):
+            continue
+        codec = str(
+            item.get("CodecType")
+            or item.get("codec_type")
+            or play.get("UrlKey")
+            or play.get("url_key")
+            or ""
+        )
+        width = play.get("Width") or play.get("width") or item.get("width") or 0
+        height = play.get("Height") or play.get("height") or item.get("height") or 0
+        size = play.get("DataSize") or play.get("data_size") or 0
+        for u in play.get("UrlList") or play.get("url_list") or []:
+            add(u, width, height, size, codec)
+
+    play_addr = video.get("playAddr") or video.get("play_addr")
+    vw = video.get("width") or 0
+    vh = video.get("height") or 0
+    if isinstance(play_addr, str):
+        add(play_addr, vw, vh)
+    elif isinstance(play_addr, dict):
+        for u in play_addr.get("UrlList") or play_addr.get("url_list") or []:
+            add(u, play_addr.get("Width") or play_addr.get("width") or vw, play_addr.get("Height") or play_addr.get("height") or vh)
+    elif isinstance(play_addr, list):
+        for item in play_addr:
+            if isinstance(item, str):
+                add(item, vw, vh)
+            elif isinstance(item, dict):
+                add(item.get("src") or item.get("url") or "", vw, vh)
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out: list[str] = []
+    for _, u in scored:
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def _parse_tiktok_item(html: str) -> dict[str, Any] | None:
+    marker = 'id="__UNIVERSAL_DATA_FOR_REHYDRATION__"'
+    idx = html.find(marker)
+    if idx != -1:
+        start = html.find(">", idx)
+        end = html.find("</script>", start + 1) if start != -1 else -1
+        if start != -1 and end != -1:
+            try:
+                data = json.loads(html[start + 1 : end])
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                detail = (data.get("__DEFAULT_SCOPE__") or {}).get("webapp.video-detail") or {}
+                item = (detail.get("itemInfo") or {}).get("itemStruct")
+                if isinstance(item, dict) and isinstance(item.get("video"), dict):
+                    return item
+    m = re.search(
+        r'<script[^>]+id="(?:SIGI_STATE|sigi-persisted-data)"[^>]*>(.*?)</script>',
+        html,
+        re.DOTALL | re.IGNORECASE,
+    )
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError:
+        return None
+    module = data.get("ItemModule") if isinstance(data, dict) else None
+    if not isinstance(module, dict):
+        return None
+    for item in module.values():
+        if isinstance(item, dict) and isinstance(item.get("video"), dict):
+            return item
+    return None
+
+
+def download_via_tiktok_page(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
+    """Прямой ролик с TikTok: playAddr / bitrateInfo, без downloadAddr (там водяной знак)."""
+    if progress:
+        progress.set("start", 8)
+    aweme_id = media_id_from_url(url, "tiktok")
+    if not aweme_id.isdigit():
+        resolved = resolve_redirect(url)
+        aweme_id = media_id_from_url(resolved, "tiktok")
+        url = resolved
+    page_url = f"https://www.tiktok.com/@i/video/{aweme_id}" if aweme_id.isdigit() else url
+    opener = _http_session()
+    try:
+        raw, final_url = _session_call(
+            opener,
+            "GET",
+            page_url,
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Referer": "https://www.tiktok.com/",
+            },
+            timeout=18,
+        )
+        html = raw.decode("utf-8", "replace")
+    except Exception as e:
+        log.warning("tiktok-page: %s", e)
+        return None
+    if "/login" in (final_url or "").lower():
+        log.warning("tiktok-page: редирект на логин")
+        return None
+    item = _parse_tiktok_item(html)
+    if not item:
+        log.warning("tiktok-page: нет данных ролика")
+        return None
+    if item.get("imagePost"):
+        log.warning("tiktok-page: это слайдшоу, не видео")
+        return None
+    video = item.get("video") if isinstance(item.get("video"), dict) else {}
+    candidates = _tiktok_nowm_candidates(video)
+    if not candidates:
+        log.warning("tiktok-page: нет ссылки без водяного знака")
+        return None
+    duration = int(video.get("duration") or item.get("video", {}).get("duration") or 0)
+    if duration > 1000:
+        duration //= 1000
+    if duration and duration > MAX_DURATION_SEC:
+        raise RuntimeError(f"Видео длиннее {MAX_DURATION_SEC // 60} минут.")
+    author_info = item.get("author") if isinstance(item.get("author"), dict) else {}
+    title = str(item.get("desc") or "TikTok").strip()
+    author = str(author_info.get("nickname") or author_info.get("uniqueId") or "TikTok").strip()
+    if progress:
+        progress.set("download", 16, title[:40])
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / "tiktok.bin"
+    last_err = None
+    for video_url in candidates[:4]:
+        try:
+            _session_download(
+                opener,
+                video_url,
+                dest,
+                progress=progress,
+                extra_headers={"Referer": "https://www.tiktok.com/"},
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            dest.unlink(missing_ok=True)
+            log.warning("tiktok-page download: %s", e)
+    if last_err or not dest.exists():
+        return None
+    prepared = prepare_telegram_video(dest, workdir, progress)
+    return result_from_file(
+        prepared,
+        title=title,
+        author=author,
+        platform="tiktok",
+        media_id=str(item.get("id") or aweme_id),
+        webpage_url=url,
+        duration=duration,
+    )
+
+
 def download_via_tikwm(
     url: str,
     workdir: Path,
@@ -2217,11 +2451,21 @@ def download_via_tikwm(
 ) -> dict[str, Any] | None:
     if progress:
         progress.set("start", 8)
-    api = "https://www.tikwm.com/api/?hd=1&url=" + quote(url, safe="")
-    try:
-        data = http_json("GET", api, headers={"Referer": "https://www.tikwm.com/"}, timeout=25)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
-        log.warning("tikwm: %s", e)
+    data: dict[str, Any] = {}
+    last_api_err: Exception | None = None
+    for api in (
+        "https://www.tikwm.com/api/?hd=1&url=" + quote(url, safe=""),
+        "https://tikwm.com/api/?hd=1&url=" + quote(url, safe=""),
+    ):
+        try:
+            data = http_json("GET", api, headers={"Referer": "https://www.tikwm.com/"}, timeout=15)
+            last_api_err = None
+            break
+        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
+            last_api_err = e
+            data = {}
+    if last_api_err or not data:
+        log.warning("tikwm: %s", last_api_err or "empty")
         return None
     info = data.get("data") if isinstance(data.get("data"), dict) else {}
     hdplay = info.get("hdplay") or data.get("hdplay")
@@ -2229,12 +2473,22 @@ def download_via_tikwm(
     wmplay = info.get("wmplay") or data.get("wmplay") or ""
     aweme_id = str(info.get("id") or media_id_from_url(url, "tiktok") or "")
     candidates: list[str] = []
+    # hdplay и play у tikwm — без водяного знака. wmplay — с логотипом, не трогаем.
     if hdplay and not looks_watermarked(str(hdplay), str(wmplay)):
         candidates.append(str(hdplay))
-    if aweme_id and no_watermark_only:
-        candidates.append(f"https://www.tikwm.com/video/media/hdplay/{aweme_id}.mp4")
-    if not no_watermark_only and play and not looks_watermarked(str(play), str(wmplay)):
+    if play and not looks_watermarked(str(play), str(wmplay)):
         candidates.append(str(play))
+    if aweme_id.isdigit():
+        candidates.append(f"https://www.tikwm.com/video/media/hdplay/{aweme_id}.mp4")
+        if not no_watermark_only:
+            candidates.append(f"https://www.tikwm.com/video/media/play/{aweme_id}.mp4")
+    seen: set[str] = set()
+    unique: list[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+    candidates = unique
     if not candidates:
         log.warning("tikwm нет ролика без водяного знака: %s", data.get("msg") or "no hdplay")
         return None
@@ -2279,6 +2533,68 @@ def download_via_tikwm(
         media_id=str(info.get("id") or media_id_from_url(url, platform)),
         webpage_url=url,
         duration=duration,
+    )
+
+
+def download_via_tikmate(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
+    if progress:
+        progress.set("start", 9)
+    try:
+        raw = http_text(
+            "POST",
+            "https://api.tikmate.app/api/lookup",
+            {"url": url},
+            {
+                "Origin": "https://tikmate.app",
+                "Referer": "https://tikmate.app/",
+            },
+            timeout=15,
+        )
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            data = {}
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
+        log.warning("tikmate: %s", e)
+        return None
+    token = str(data.get("token") or "")
+    aweme_id = str(data.get("id") or media_id_from_url(url, "tiktok") or "")
+    if not token or not aweme_id.isdigit():
+        log.warning("tikmate: нет token/id")
+        return None
+    candidates = [
+        f"https://tikmate.app/download/{token}/{aweme_id}.mp4?hd=1",
+        f"https://api.tikmate.app/download/{token}/{aweme_id}.mp4?hd=1",
+        f"https://tikmate.app/download/{token}/{aweme_id}.mp4",
+    ]
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / "tikmate.bin"
+    last_err = None
+    if progress:
+        progress.set("download", 18, str(data.get("desc") or "TikTok")[:40])
+    for video_url in candidates:
+        try:
+            download_remote_video(
+                video_url,
+                dest,
+                progress=progress,
+                extra_headers={"Referer": "https://tikmate.app/"},
+            )
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            dest.unlink(missing_ok=True)
+            log.warning("tikmate download: %s", e)
+    if last_err or not dest.exists():
+        return None
+    video = prepare_telegram_video(dest, workdir, progress)
+    return result_from_file(
+        video,
+        title=str(data.get("desc") or "TikTok").strip(),
+        author=str(data.get("author_name") or data.get("author_id") or "TikTok").strip(),
+        platform="tiktok",
+        media_id=aweme_id,
+        webpage_url=url,
     )
 
 
@@ -2343,19 +2659,32 @@ def _session_call(opener, method: str, url: str, data: dict | None = None, heade
 
 def score_nowm_link(url: str, label: str = "") -> int:
     blob = f"{url} {label}".lower()
-    if any(s in blob for s in ("watermark", "wmplay", "playwm", "[watermark]", "with wm")):
+    no_wm = any(
+        s in blob
+        for s in (
+            "no watermark",
+            "without watermark",
+            "without_watermark",
+            "no-watermark",
+            "nowm",
+            "no_watermark",
+        )
+    )
+    if any(s in blob for s in ("wmplay", "playwm", "[watermark]", "with wm", "with_watermark", "use_wm")):
+        return -10_000
+    if "watermark" in blob and not no_wm:
         return -10_000
     if any(s in blob for s in ("mp3", "audio only", "download mp3")):
         return -5_000
     score = 0
+    if no_wm:
+        score += 2000
     if "_original.mp4" in blob or "[hd]" in blob or " mp4 hd" in blob or "-hd.mp4" in blob:
-        score += 1000
+        score += 800
     if "tokcdn.com" in blob or "original" in blob:
         score += 600
     if "hd" in blob:
         score += 250
-    if "no watermark" in blob or "without watermark" in blob or "without_watermark" in blob:
-        score += 200
     if "pve-0068" in blob:
         score -= 400
     return score
@@ -2366,7 +2695,7 @@ def download_via_musicaldown(url: str, workdir: Path, progress: DownloadProgress
         progress.set("start", 8)
     opener = _http_session()
     try:
-        home, _ = _session_call(opener, "GET", "https://musicaldown.com/en", headers={"Accept": "text/html"})
+        home, _ = _session_call(opener, "GET", "https://musicaldown.com/en", headers={"Accept": "text/html"}, timeout=15)
         html = home.decode("utf-8", "replace")
         form: dict[str, str] = {}
         url_key = None
@@ -2389,6 +2718,7 @@ def download_via_musicaldown(url: str, workdir: Path, progress: DownloadProgress
             "https://musicaldown.com/download",
             form,
             {"Origin": "https://musicaldown.com", "Referer": "https://musicaldown.com/en", "Accept": "text/html"},
+            timeout=18,
         )
         page = raw.decode("utf-8", "replace")
     except Exception as e:
@@ -2447,7 +2777,7 @@ def download_via_savetik(url: str, workdir: Path, progress: DownloadProgress | N
                 "Referer": "https://savetik.co/en",
                 "X-Requested-With": "XMLHttpRequest",
             },
-            timeout=30,
+            timeout=18,
         )
         payload = json.loads(raw)
         html = str(payload.get("data") or "")
@@ -2504,7 +2834,7 @@ def download_via_ssstik(url: str, workdir: Path, progress: DownloadProgress | No
             "https://ssstik.io/en",
             headers={"User-Agent": HTTP_UA, "Accept": "text/html"},
         )
-        home = opener.open(home_req, timeout=20).read().decode("utf-8", "replace")
+        home = opener.open(home_req, timeout=15).read().decode("utf-8", "replace")
         tt_m = re.search(r"s_tt\s*=\s*'([^']+)'", home) or re.search(r"tt['\"]?\s*[:=]\s*['\"]([^'\"]+)", home)
         tt = tt_m.group(1) if tt_m else "UlRHZ000"
         body = urlencode({"id": url, "locale": "en", "tt": tt}).encode("utf-8")
@@ -2522,7 +2852,7 @@ def download_via_ssstik(url: str, workdir: Path, progress: DownloadProgress | No
                 "Accept": "*/*",
             },
         )
-        html = opener.open(post_req, timeout=35).read().decode("utf-8", "replace")
+        html = opener.open(post_req, timeout=22).read().decode("utf-8", "replace")
     except Exception as e:
         log.warning("ssstik: %s", e)
         return None
@@ -2805,7 +3135,15 @@ def download_via_ytdlp(
 
     outtmpl = str(workdir / "ytdlp.%(ext)s")
     if platform == "tiktok":
-        fmt = "download/download_addr"
+        # download / download_addr — это файл С водяным знаком TikTok.
+        # playAddr / bitrateInfo / play_addr — оригинал без логотипа.
+        fmt = (
+            "bestvideo[format_id!=download][format_id!=download_addr][format_note!*=watermark]"
+            "+bestaudio/"
+            "best[format_id!=download][format_id!=download_addr][format_note!*=watermark]/"
+            "best[format_id^=play]/"
+            "best[format_id!=download][format_id!=download_addr]"
+        )
     else:
         fmt = "bestvideo*+bestaudio/best"
     opts: dict[str, Any] = {
@@ -2847,7 +3185,14 @@ def download_via_ytdlp(
     except (DownloadError, YoutubeDLError) as e:
         log.warning("yt-dlp high: %s", e)
         if "ffmpeg" in str(e).lower() or "merging" in str(e).lower():
-            opts["format"] = "best[ext=mp4]/best"
+            if platform == "tiktok":
+                opts["format"] = (
+                    "best[ext=mp4][format_id!=download][format_id!=download_addr]"
+                    "[format_note!*=watermark]/"
+                    "best[format_id^=play]/best[ext=mp4][format_id!=download]"
+                )
+            else:
+                opts["format"] = "best[ext=mp4]/best"
             opts.pop("merge_output_format", None)
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
@@ -2957,48 +3302,86 @@ def attach_tiktok_audio(
     return result
 
 
+def _finish_download(
+    name: str,
+    got: dict[str, Any],
+    platform: str,
+    url: str,
+    dest: Path,
+    progress: DownloadProgress | None,
+) -> dict[str, Any] | None:
+    if not got or not got.get("path") or not Path(got["path"]).exists():
+        return None
+    if not is_probably_video(Path(got["path"])):
+        log.warning("%s: это не видеофайл", name)
+        return None
+    if platform == "tiktok":
+        got = attach_tiktok_audio(got, url, dest, progress)
+    if progress:
+        progress.set("convert", 94)
+    got["path"] = fit_telegram_limit(Path(got["path"]), dest, progress)
+    log.info("Скачал через %s: %s %sx%s", name, got.get("title"), got.get("width"), got.get("height"))
+    return got
+
+
+def _try_backend(
+    name: str,
+    fn,
+    platform: str,
+    url: str,
+    dest: Path,
+    progress: DownloadProgress | None,
+) -> tuple[dict[str, Any] | None, str]:
+    dest.mkdir(parents=True, exist_ok=True)
+    try:
+        got = fn()
+        finished = _finish_download(name, got, platform, url, dest, progress) if got else None
+        return finished, ""
+    except RuntimeError as e:
+        log.warning("%s: %s", name, e)
+        return None, str(e)
+    except Exception as e:
+        log.warning("%s unexpected: %s", name, e)
+        return None, str(e)
+
+
 def download_video(url: str, platform: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any]:
     url = normalize_media_url(url, platform)
     last_err = ""
     backends: list[tuple[str, Any]] = []
     if platform == "tiktok":
-        backends.append(("musicaldown", lambda: download_via_musicaldown(url, workdir / "musicaldown", progress)))
-        backends.append(("savetik", lambda: download_via_savetik(url, workdir / "savetik", progress)))
-        backends.append(
-            ("tikwm", lambda: download_via_tikwm(url, workdir / "tikwm", progress, no_watermark_only=True))
+        backends.extend(
+            [
+                ("tikwm", lambda: download_via_tikwm(url, workdir / "tikwm", progress, no_watermark_only=True)),
+                ("tikmate", lambda: download_via_tikmate(url, workdir / "tikmate", progress)),
+                ("tiktok", lambda: download_via_tiktok_page(url, workdir / "tiktok", progress)),
+                ("ssstik", lambda: download_via_ssstik(url, workdir / "ssstik", progress)),
+                ("snaptik", lambda: download_via_snaptik(url, workdir / "snaptik", progress)),
+                ("musicaldown", lambda: download_via_musicaldown(url, workdir / "musicaldown", progress)),
+                ("savetik", lambda: download_via_savetik(url, workdir / "savetik", progress)),
+                ("tikwm-direct", lambda: download_via_tikwm_direct(url, workdir / "tikwm_direct", progress)),
+                ("yt-dlp", lambda: download_via_ytdlp(url, platform, workdir / "ytdlp", progress)),
+            ]
         )
-        backends.append(("tikwm-direct", lambda: download_via_tikwm_direct(url, workdir / "tikwm_direct", progress)))
-        backends.append(("yt-dlp", lambda: download_via_ytdlp(url, platform, workdir / "ytdlp", progress)))
     else:
-        backends.append(("snapsave", lambda: download_via_snapsave(url, workdir / "snapsave", progress)))
-        backends.append(("embed", lambda: download_via_instagram_embed(url, workdir / "embed", progress)))
-        backends.append(("yt-dlp", lambda: download_via_ytdlp(url, platform, workdir / "ytdlp", progress)))
-        backends.append(("tikwm", lambda: download_via_tikwm(url, workdir / "tikwm", progress)))
+        backends.extend(
+            [
+                ("snapsave", lambda: download_via_snapsave(url, workdir / "snapsave", progress)),
+                ("embed", lambda: download_via_instagram_embed(url, workdir / "embed", progress)),
+                ("yt-dlp", lambda: download_via_ytdlp(url, platform, workdir / "ytdlp", progress)),
+                ("tikwm", lambda: download_via_tikwm(url, workdir / "tikwm", progress)),
+            ]
+        )
 
     for name, fn in backends:
         dest = workdir / name
-        dest.mkdir(parents=True, exist_ok=True)
-        try:
-            got = fn()
-            if got and got.get("path") and Path(got["path"]).exists():
-                if not is_probably_video(Path(got["path"])):
-                    log.warning("%s: это не видеофайл", name)
-                    continue
-                if platform == "tiktok":
-                    got = attach_tiktok_audio(got, url, dest, progress)
-                if progress:
-                    progress.set("convert", 94)
-                got["path"] = fit_telegram_limit(Path(got["path"]), dest, progress)
-                log.info("Скачал через %s: %s %sx%s", name, got.get("title"), got.get("width"), got.get("height"))
-                return got
-        except RuntimeError as e:
-            last_err = str(e)
-            log.warning("%s: %s", name, e)
+        got, err = _try_backend(name, fn, platform, url, dest, progress)
+        if err:
+            last_err = err
             if "длиннее" in last_err:
-                raise
-        except Exception as e:
-            last_err = str(e)
-            log.warning("%s unexpected: %s", name, e)
+                raise RuntimeError(last_err)
+        if got:
+            return got
     raise RuntimeError(humanize_error(last_err, platform) if last_err else "Не получилось скачать. Попробуй другую ссылку.")
 
 
