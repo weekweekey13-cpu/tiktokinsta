@@ -84,7 +84,7 @@ BOT_USERNAME = "downloader_insta_tiktokbot"
 
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "900"))
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "49"))
-MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "200"))
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "70"))
 
 TIKTOK_RE = re.compile(
     r"(?P<url>(?:https?://)?(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/[^\s<>]+)",
@@ -1906,7 +1906,7 @@ def prepare_telegram_video(src: Path, workdir: Path, progress: DownloadProgress 
         "-c:v",
         "libx264",
         "-preset",
-        "slow",
+        "veryfast",
         "-crf",
         "16",
         "-pix_fmt",
@@ -1931,7 +1931,7 @@ def prepare_telegram_video(src: Path, workdir: Path, progress: DownloadProgress 
         "-c:v",
         "libx264",
         "-preset",
-        "slow",
+        "veryfast",
         "-crf",
         "16",
         "-pix_fmt",
@@ -1950,6 +1950,14 @@ def prepare_telegram_video(src: Path, workdir: Path, progress: DownloadProgress 
     return dest
 
 
+def is_probably_video(path: Path) -> bool:
+    try:
+        head = path.read_bytes()[:16]
+    except OSError:
+        return False
+    return b"ftyp" in head or head.startswith(b"\x1aE\xdf\xa3")
+
+
 def fit_telegram_limit(src: Path, workdir: Path, progress: DownloadProgress | None = None) -> Path:
     limit = MAX_FILE_MB * 1024 * 1024
     if src.stat().st_size <= limit:
@@ -1957,42 +1965,9 @@ def fit_telegram_limit(src: Path, workdir: Path, progress: DownloadProgress | No
     if progress:
         progress.set("convert", 96)
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
-    probe = probe_video(src)
-    duration = max(int(probe.get("duration") or 1), 1)
     dest = workdir / "video_fit.mp4"
-    for crf in ("18", "20", "22", "24"):
-        dest.unlink(missing_ok=True)
-        cmd = [
-            ffmpeg,
-            "-y",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-i",
-            str(src),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "slow",
-            "-crf",
-            crf,
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "160k",
-            "-movflags",
-            "+faststart",
-            str(dest),
-        ]
-        if _run_ffmpeg(cmd, 360) and dest.exists() and dest.stat().st_size <= limit:
-            return dest
-    audio_bits = 160_000
-    video_bits = max(800_000, int((limit * 8 * 0.92) / duration) - audio_bits)
     dest.unlink(missing_ok=True)
-    two_pass_log = workdir / "ffpass"
-    pass1 = [
+    cmd = [
         ffmpeg,
         "-y",
         "-hide_banner",
@@ -2003,19 +1978,21 @@ def fit_telegram_limit(src: Path, workdir: Path, progress: DownloadProgress | No
         "-c:v",
         "libx264",
         "-preset",
-        "slow",
-        "-b:v",
-        str(video_bits),
-        "-pass",
-        "1",
-        "-passlogfile",
-        str(two_pass_log),
-        "-an",
-        "-f",
-        "mp4",
-        os.devnull,
+        "veryfast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(dest),
     ]
-    pass2 = [
+    if _run_ffmpeg(cmd, 90) and dest.exists() and dest.stat().st_size <= limit:
+        return dest
+    dest.unlink(missing_ok=True)
+    cmd_aac = [
         ffmpeg,
         "-y",
         "-hide_banner",
@@ -2026,13 +2003,11 @@ def fit_telegram_limit(src: Path, workdir: Path, progress: DownloadProgress | No
         "-c:v",
         "libx264",
         "-preset",
-        "slow",
-        "-b:v",
-        str(video_bits),
-        "-pass",
-        "2",
-        "-passlogfile",
-        str(two_pass_log),
+        "veryfast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
@@ -2041,9 +2016,11 @@ def fit_telegram_limit(src: Path, workdir: Path, progress: DownloadProgress | No
         "+faststart",
         str(dest),
     ]
-    if _run_ffmpeg(pass1, 360) and _run_ffmpeg(pass2, 360) and dest.exists() and dest.stat().st_size <= limit:
+    if _run_ffmpeg(cmd_aac, 90) and dest.exists() and dest.stat().st_size <= limit:
         return dest
-    raise RuntimeError(f"Файл слишком большой даже после сжатия. Лимит Telegram — {MAX_FILE_MB} МБ.")
+    raise RuntimeError(
+        f"Файл слишком большой для Telegram ({src.stat().st_size // 1024 // 1024} МБ). Пришли ролик короче."
+    )
 
 
 def cookies_file() -> str | None:
@@ -3004,8 +2981,14 @@ def download_video(url: str, platform: str, workdir: Path, progress: DownloadPro
         try:
             got = fn()
             if got and got.get("path") and Path(got["path"]).exists():
+                if not is_probably_video(Path(got["path"])):
+                    log.warning("%s: это не видеофайл", name)
+                    continue
                 if platform == "tiktok":
                     got = attach_tiktok_audio(got, url, dest, progress)
+                if progress:
+                    progress.set("convert", 94)
+                got["path"] = fit_telegram_limit(Path(got["path"]), dest, progress)
                 log.info("Скачал через %s: %s %sx%s", name, got.get("title"), got.get("width"), got.get("height"))
                 return got
         except RuntimeError as e:
@@ -3110,13 +3093,9 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     last_text = shown
                 await asyncio.sleep(1)
             result = dl_task.result()
-            progress.set("send", 97, result.get("title") or "")
-            try:
-                await status.edit_text(format_progress(progress))
-            except BadRequest:
-                pass
-
-            video_path = fit_telegram_limit(Path(result["path"]), workdir, progress)
+            video_path = Path(result["path"])
+            if not video_path.exists() or not is_probably_video(video_path):
+                raise RuntimeError("Источник отдал битый файл. Попробуй ссылку ещё раз.")
             probe = probe_video(video_path)
             if probe.get("width"):
                 result["width"] = probe["width"]
@@ -3125,13 +3104,21 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if probe.get("duration") and not result.get("duration"):
                 result["duration"] = probe["duration"]
 
+            progress.set("send", 97, result.get("title") or "")
+            try:
+                await status.edit_text(format_progress(progress))
+            except BadRequest:
+                pass
+
             caption = video_caption(result.get("title") or "Видео", result.get("author") or "", int(result.get("duration") or 0), settings)
             markup = ads_keyboard(settings) if (settings.get("ads") or {}).get("enabled_after_download") else None
+            send_timeouts = {"read_timeout": 120, "write_timeout": 180, "connect_timeout": 30}
             send_kwargs: dict[str, Any] = {
                 "video": video_path.open("rb"),
                 "filename": f"{safe_filename(result.get('title') or 'video')}.mp4",
                 "caption": caption,
                 "supports_streaming": True,
+                **send_timeouts,
             }
             if result.get("duration"):
                 send_kwargs["duration"] = int(result["duration"])
@@ -3142,8 +3129,29 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if markup:
                 send_kwargs["reply_markup"] = markup
             try:
-                sent = await msg.reply_video(**send_kwargs)
-            finally:
+                sent = await asyncio.wait_for(msg.reply_video(**send_kwargs), timeout=200)
+            except Exception as send_err:
+                log.warning("reply_video не прошёл (%s), пробую документом", send_err)
+                try:
+                    send_kwargs["video"].close()
+                except Exception:
+                    pass
+                doc_kwargs: dict[str, Any] = {
+                    "document": video_path.open("rb"),
+                    "filename": f"{safe_filename(result.get('title') or 'video')}.mp4",
+                    "caption": caption,
+                    **send_timeouts,
+                }
+                if markup:
+                    doc_kwargs["reply_markup"] = markup
+                try:
+                    sent = await asyncio.wait_for(msg.reply_document(**doc_kwargs), timeout=200)
+                finally:
+                    try:
+                        doc_kwargs["document"].close()
+                    except Exception:
+                        pass
+            else:
                 try:
                     send_kwargs["video"].close()
                 except Exception:
@@ -3376,6 +3384,11 @@ def main() -> None:
         Application.builder()
         .token(BOT_TOKEN)
         .concurrent_updates(True)
+        .connect_timeout(20)
+        .read_timeout(60)
+        .write_timeout(180)
+        .pool_timeout(10)
+        .get_updates_read_timeout(30)
         .post_init(_post_init)
         .build()
     )
