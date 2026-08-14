@@ -1,6 +1,6 @@
 Бот: https://t.me/downloader_insta_tiktokbot
 
-Админ: @bonamartin69
+Админы: @bonamartin69, @itsenlay
 Команда: /admin
 
 1) Добавь бота АДМИНОМ в канал (обязательно, иначе пишет что ты не подписан).

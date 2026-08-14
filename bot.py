@@ -3,7 +3,7 @@ TikTok / Instagram → видео Telegram-бот.
 
 Пользователь кидает ссылку — получает видео в лучшем качестве без водяного знака.
 Перед скачиванием обязательна подписка на каналы из админки.
-Админ @bonamartin69: каналы, реклама, рассылка, рестарт.
+Админы @bonamartin69, @itsenlay: каналы, реклама, рассылка, рестарт.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
@@ -67,9 +67,9 @@ BOT_TOKEN = load_token()
 PORT = int(os.getenv("PORT", "10000"))
 ADMIN_USERNAMES = {
     u.strip().lstrip("@").lower()
-    for u in os.getenv("ADMIN_USERNAMES", "bonamartin69").split(",")
+    for u in os.getenv("ADMIN_USERNAMES", "bonamartin69,itsenlay").split(",")
     if u.strip()
-} | {"bonamartin69"}
+} | {"bonamartin69", "itsenlay"}
 
 DATA_DIR = Path(os.getenv("DATA_DIR", str(ROOT / "data")))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -82,7 +82,8 @@ SUBS_EVENT_LIMIT = 400
 BOT_USERNAME = "downloader_insta_tiktokbot"
 
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "900"))
-MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "45"))
+MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "49"))
+MAX_DOWNLOAD_MB = int(os.getenv("MAX_DOWNLOAD_MB", "200"))
 
 TIKTOK_RE = re.compile(
     r"(?P<url>(?:https?://)?(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/[^\s<>]+)",
@@ -1647,6 +1648,24 @@ def extract_media_link(text: str) -> tuple[str, str] | None:
     return None
 
 
+def normalize_media_url(url: str, platform: str) -> str:
+    if platform == "tiktok" and any(p in url.lower() for p in ("vm.tiktok.com", "vt.tiktok.com", "tiktok.com/t/")):
+        return resolve_redirect(url)
+    if platform != "instagram":
+        return url
+    resolved = url
+    low = url.lower()
+    if "/share/" in low or "instagram.com/s/" in low:
+        resolved = resolve_redirect(url)
+    m = re.search(r"/(reel|reels|p|tv)/([A-Za-z0-9_-]+)", resolved, re.IGNORECASE)
+    if m:
+        kind = m.group(1).lower()
+        if kind == "reels":
+            kind = "reel"
+        return f"https://www.instagram.com/{kind}/{m.group(2)}/"
+    return resolved
+
+
 def media_id_from_url(url: str, platform: str) -> str:
     if platform == "tiktok":
         m = re.search(r"/video/(\d+)", url)
@@ -1736,7 +1755,7 @@ def http_download(
     if extra_headers:
         hdrs.update(extra_headers)
     req = Request(url, headers=hdrs)
-    limit = MAX_FILE_MB * 1024 * 1024
+    limit = MAX_DOWNLOAD_MB * 1024 * 1024
     with urlopen(req, timeout=timeout) as resp, dest.open("wb") as out:
         total = 0
         try:
@@ -1786,48 +1805,70 @@ def find_file(folder: Path, exts: set[str]) -> Path | None:
     return files[0]
 
 
-def probe_video(path: Path) -> dict[str, int]:
+def _ffprobe_json(path: Path) -> dict[str, Any]:
     ffprobe = shutil.which("ffprobe") or "ffprobe"
     cmd = [
         ffprobe,
         "-v",
         "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=width,height,duration",
-        "-show_entries",
-        "format=duration",
+        "-show_streams",
+        "-show_format",
         "-of",
         "json",
         str(path),
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=20)
-        data = json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
+        proc = subprocess.run(cmd, capture_output=True, timeout=25)
+        return json.loads(proc.stdout.decode("utf-8", "replace") or "{}")
     except Exception:
-        return {"width": 0, "height": 0, "duration": 0}
+        return {}
+
+
+def probe_video(path: Path) -> dict[str, Any]:
+    data = _ffprobe_json(path)
     streams = data.get("streams") or []
-    stream = streams[0] if streams else {}
+    video = next((s for s in streams if s.get("codec_type") == "video"), {})
+    audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
     fmt = data.get("format") or {}
     try:
-        duration = float(stream.get("duration") or fmt.get("duration") or 0)
+        duration = float(video.get("duration") or fmt.get("duration") or 0)
     except (TypeError, ValueError):
         duration = 0
     return {
-        "width": int(stream.get("width") or 0),
-        "height": int(stream.get("height") or 0),
+        "width": int(video.get("width") or 0),
+        "height": int(video.get("height") or 0),
         "duration": int(duration or 0),
+        "vcodec": str(video.get("codec_name") or ""),
+        "acodec": str(audio.get("codec_name") or ""),
     }
 
 
-def ensure_mp4(src: Path, workdir: Path, progress: DownloadProgress | None = None) -> Path:
-    if src.suffix.lower() == ".mp4" and src.stat().st_size >= 2000:
-        return src
+def _run_ffmpeg(cmd: list[str], timeout: int = 300) -> bool:
+    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    return proc.returncode == 0
+
+
+def prepare_telegram_video(src: Path, workdir: Path, progress: DownloadProgress | None = None) -> Path:
+    """Keep original pixels. Remux when possible, high-quality encode only if Telegram needs it."""
+    workdir.mkdir(parents=True, exist_ok=True)
     if progress:
-        progress.set("convert", 94)
-    dest = workdir / "video.mp4"
+        progress.set("convert", 93)
     ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    if not shutil.which("ffmpeg"):
+        dest = workdir / "video.mp4"
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+        return dest
+    probe = probe_video(src)
+    vcodec = (probe.get("vcodec") or "").lower()
+    acodec = (probe.get("acodec") or "").lower()
+    dest = workdir / "video.mp4"
+    telegram_ok = vcodec in {"h264", "avc1"} and acodec in {"aac", "mp4a", "mp3"} and src.suffix.lower() == ".mp4"
+    if telegram_ok:
+        if src.resolve() != dest.resolve():
+            shutil.copy2(src, dest)
+        return dest
+
     copy_cmd = [
         ffmpeg,
         "-y",
@@ -1842,11 +1883,15 @@ def ensure_mp4(src: Path, workdir: Path, progress: DownloadProgress | None = Non
         "+faststart",
         str(dest),
     ]
-    proc = subprocess.run(copy_cmd, capture_output=True, timeout=90)
-    if proc.returncode == 0 and dest.exists() and dest.stat().st_size >= 2000:
-        return dest
+    if _run_ffmpeg(copy_cmd, 120) and dest.exists() and dest.stat().st_size >= 2000:
+        copied = probe_video(dest)
+        if (copied.get("vcodec") or "").lower() in {"h264", "avc1"}:
+            return dest
     dest.unlink(missing_ok=True)
-    re_cmd = [
+
+    if progress:
+        progress.set("convert", 95)
+    encode_cmd = [
         ffmpeg,
         "-y",
         "-hide_banner",
@@ -1854,27 +1899,122 @@ def ensure_mp4(src: Path, workdir: Path, progress: DownloadProgress | None = Non
         "error",
         "-i",
         str(src),
-        "-vf",
-        "scale='min(1280,iw)':-2",
         "-c:v",
         "libx264",
         "-preset",
-        "veryfast",
+        "slow",
         "-crf",
-        "23",
+        "16",
+        "-pix_fmt",
+        "yuv420p",
         "-c:a",
         "aac",
         "-b:a",
-        "128k",
+        "192k",
         "-movflags",
         "+faststart",
         str(dest),
     ]
-    proc = subprocess.run(re_cmd, capture_output=True, timeout=180)
-    if proc.returncode != 0 or not dest.exists() or dest.stat().st_size < 2000:
-        err = (proc.stderr or b"").decode("utf-8", "replace")[-300:]
-        raise RuntimeError(f"Не смог собрать MP4. {err}".strip())
+    if not _run_ffmpeg(encode_cmd, 360) or not dest.exists() or dest.stat().st_size < 2000:
+        dest.unlink(missing_ok=True)
+        raise RuntimeError("Не смог собрать MP4 без потери качества.")
     return dest
+
+
+def fit_telegram_limit(src: Path, workdir: Path, progress: DownloadProgress | None = None) -> Path:
+    limit = MAX_FILE_MB * 1024 * 1024
+    if src.stat().st_size <= limit:
+        return src
+    if progress:
+        progress.set("convert", 96)
+    ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    probe = probe_video(src)
+    duration = max(int(probe.get("duration") or 1), 1)
+    dest = workdir / "video_fit.mp4"
+    for crf in ("18", "20", "22", "24"):
+        dest.unlink(missing_ok=True)
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(src),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "slow",
+            "-crf",
+            crf,
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-movflags",
+            "+faststart",
+            str(dest),
+        ]
+        if _run_ffmpeg(cmd, 360) and dest.exists() and dest.stat().st_size <= limit:
+            return dest
+    audio_bits = 160_000
+    video_bits = max(800_000, int((limit * 8 * 0.92) / duration) - audio_bits)
+    dest.unlink(missing_ok=True)
+    two_pass_log = workdir / "ffpass"
+    pass1 = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "slow",
+        "-b:v",
+        str(video_bits),
+        "-pass",
+        "1",
+        "-passlogfile",
+        str(two_pass_log),
+        "-an",
+        "-f",
+        "mp4",
+        os.devnull,
+    ]
+    pass2 = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "slow",
+        "-b:v",
+        str(video_bits),
+        "-pass",
+        "2",
+        "-passlogfile",
+        str(two_pass_log),
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+faststart",
+        str(dest),
+    ]
+    if _run_ffmpeg(pass1, 360) and _run_ffmpeg(pass2, 360) and dest.exists() and dest.stat().st_size <= limit:
+        return dest
+    raise RuntimeError(f"Файл слишком большой даже после сжатия. Лимит Telegram — {MAX_FILE_MB} МБ.")
 
 
 def cookies_file() -> str | None:
@@ -1916,6 +2056,137 @@ def result_from_file(
     }
 
 
+def http_text(
+    method: str,
+    url: str,
+    payload: dict | bytes | None = None,
+    headers: dict | None = None,
+    timeout: int = 25,
+) -> str:
+    hdrs = {"User-Agent": HTTP_UA, "Accept": "*/*"}
+    if headers:
+        hdrs.update(headers)
+    data = None
+    if isinstance(payload, dict):
+        if hdrs.get("Content-Type", "").startswith("application/json"):
+            data = json.dumps(payload).encode("utf-8")
+        else:
+            data = urlencode(payload).encode("utf-8")
+            hdrs.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    elif isinstance(payload, bytes):
+        data = payload
+    req = Request(url, data=data, headers=hdrs, method=method)
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def looks_watermarked(url: str) -> bool:
+    low = (url or "").lower()
+    return any(s in low for s in ("wmplay", "watermark", "with_watermark", "playwm", "/wm/"))
+
+
+def decode_snap_app(args: list[str]) -> str:
+    h, _u, n, t, e, _r = args
+    t_num = int(t)
+    e_num = int(e)
+    alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
+
+    def decode(d: str, ev: int, fv: int) -> str:
+        h_arr = alphabet[:ev]
+        i_arr = alphabet[:fv]
+        j = 0
+        for c, b in enumerate(reversed(d)):
+            idx = h_arr.find(b)
+            if idx != -1:
+                j += idx * (ev ** c)
+        k = ""
+        while j > 0:
+            k = i_arr[j % fv] + k
+            j //= fv
+        return k or "0"
+
+    result: list[str] = []
+    i = 0
+    while i < len(h):
+        s = ""
+        while i < len(h) and h[i] != n[e_num]:
+            s += h[i]
+            i += 1
+        i += 1
+        for j, ch in enumerate(n):
+            s = s.replace(ch, str(j))
+        result.append(chr(int(decode(s, e_num, 10)) - t_num))
+    return "".join(result)
+
+
+def decrypt_snapsave(html: str) -> str:
+    packed = html.split("decodeURIComponent(escape(r))}(")[1].split("))")[0]
+    args = [v.replace('"', "").strip() for v in packed.split(",")]
+    decoded = decode_snap_app(args)
+    alert = decoded.split('document.querySelector("#alert").innerHTML = "')
+    if len(alert) > 1:
+        msg = alert[1].split('";')[0].strip()
+        if msg:
+            raise RuntimeError(msg)
+    inner = decoded.split('getElementById("download-section").innerHTML = "')[1]
+    inner = inner.split('"; document.getElementById("inputData").remove(); ')[0]
+    return inner.replace("\\/", "/").replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
+
+
+def pick_best_href(html: str) -> str | None:
+    hrefs = re.findall(r'href="(https?://[^"]+)"', html, re.IGNORECASE)
+    videos: list[str] = []
+    for href in hrefs:
+        low = href.lower()
+        if any(s in low for s in ("play.google.com", "apps.apple.com", "javascript:", "mailto:")):
+            continue
+        if looks_watermarked(href):
+            continue
+        videos.append(href)
+    if not videos:
+        return None
+
+    def score(link: str) -> tuple[int, int]:
+        low = link.lower()
+        res = 0
+        for label, pts in (("1080", 1080), ("720", 720), ("hd", 800), ("origin", 900)):
+            if label in low:
+                res = max(res, pts)
+        m = re.search(r"(\d{3,4})p", low)
+        if m:
+            res = max(res, int(m.group(1)))
+        return (res, len(link))
+
+    return max(videos, key=score)
+
+
+def download_remote_video(
+    video_url: str,
+    dest: Path,
+    progress: DownloadProgress | None = None,
+    extra_headers: dict | None = None,
+) -> None:
+    headers = {
+        "User-Agent": HTTP_UA,
+        "Accept": "*/*",
+        "Referer": "https://www.instagram.com/",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    try:
+        http_download(video_url, dest, timeout=120, progress=progress, extra_headers=headers)
+        return
+    except Exception as first:
+        if "TelegramBot" not in headers.get("User-Agent", ""):
+            headers["User-Agent"] = "TelegramBot (like TwitterBot)"
+            try:
+                http_download(video_url, dest, timeout=120, progress=progress, extra_headers=headers)
+                return
+            except Exception:
+                pass
+        raise first
+
+
 def download_via_tikwm(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
     if progress:
         progress.set("start", 8)
@@ -1925,98 +2196,145 @@ def download_via_tikwm(url: str, workdir: Path, progress: DownloadProgress | Non
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
         log.warning("tikwm: %s", e)
         return None
-    if int(data.get("code") or -1) != 0:
-        log.warning("tikwm отказ: %s", data.get("msg") or data)
-        return None
     info = data.get("data") if isinstance(data.get("data"), dict) else {}
-    video_url = info.get("hdplay") or info.get("play")
-    if not video_url or "watermark" in str(video_url).lower():
+    candidates = [
+        info.get("hdplay"),
+        data.get("hdplay"),
+        info.get("play"),
+        data.get("play"),
+    ]
+    video_url = next((u for u in candidates if u and not looks_watermarked(str(u))), None)
+    if not video_url:
+        log.warning("tikwm отказ: %s", data.get("msg") or data)
         return None
     title = (info.get("title") or "TikTok").strip()
     author_info = info.get("author") if isinstance(info.get("author"), dict) else {}
     author = (author_info.get("nickname") or author_info.get("unique_id") or "TikTok").strip()
     if progress:
         progress.set("download", 15, title)
+    workdir.mkdir(parents=True, exist_ok=True)
     dest = workdir / "tikwm.mp4"
-    http_download(video_url, dest, progress=progress, extra_headers={"Referer": "https://www.tikwm.com/"})
+    download_remote_video(str(video_url), dest, progress=progress, extra_headers={"Referer": "https://www.tikwm.com/"})
     duration = int(info.get("duration") or 0)
     if duration and duration > MAX_DURATION_SEC:
         dest.unlink(missing_ok=True)
         raise RuntimeError(f"Видео длиннее {MAX_DURATION_SEC // 60} минут.")
+    platform = "tiktok" if "tiktok" in url.lower() else "instagram"
+    video = prepare_telegram_video(dest, workdir, progress)
     return result_from_file(
-        dest,
+        video,
         title=title,
         author=author,
-        platform="tiktok",
-        media_id=str(info.get("id") or media_id_from_url(url, "tiktok")),
+        platform=platform,
+        media_id=str(info.get("id") or media_id_from_url(url, platform)),
         webpage_url=url,
         duration=duration,
     )
 
 
-def download_via_cobalt(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
-    instances = (
-        "https://api.cobalt.tools/",
-        "https://cobalt-api.hyper.lol/",
+def download_via_snapsave(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
+    if progress:
+        progress.set("start", 10)
+    try:
+        raw = http_text(
+            "POST",
+            "https://snapsave.app/action.php?lang=en",
+            {"url": url},
+            {
+                "Origin": "https://snapsave.app",
+                "Referer": "https://snapsave.app/",
+                "Accept": "*/*",
+            },
+            timeout=30,
+        )
+        html = decrypt_snapsave(raw)
+    except Exception as e:
+        log.warning("snapsave: %s", e)
+        return None
+    video_url = pick_best_href(html)
+    if not video_url:
+        log.warning("snapsave: нет прямой ссылки")
+        return None
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / "snapsave.bin"
+    if progress:
+        progress.set("download", 18)
+    download_remote_video(video_url, dest, progress=progress)
+    video = prepare_telegram_video(dest, workdir, progress)
+    platform = "tiktok" if "tiktok" in url.lower() else "instagram"
+    return result_from_file(
+        video,
+        title="Instagram" if platform == "instagram" else "TikTok",
+        author=platform,
+        platform=platform,
+        media_id=media_id_from_url(url, platform),
+        webpage_url=url,
     )
-    payload = {
-        "url": url,
-        "videoQuality": "max",
-        "filenameStyle": "basic",
-        "downloadMode": "auto",
-        "tiktokFullAudio": False,
-    }
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": HTTP_UA,
-    }
-    last_err = ""
-    for base in instances:
+
+
+def download_via_instagram_embed(url: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any] | None:
+    short = media_id_from_url(url, "instagram")
+    if not short:
+        return None
+    pages = [
+        f"https://www.instagram.com/reel/{short}/embed/captioned/",
+        f"https://www.instagram.com/p/{short}/embed/captioned/",
+        f"https://www.ddinstagram.com/reel/{short}/",
+        f"https://www.ddinstagram.com/p/{short}/",
+    ]
+    video_url = ""
+    for page in pages:
         try:
-            if progress:
-                progress.set("start", 10)
-            data = http_json("POST", base, payload, headers=headers, timeout=20)
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as e:
-            last_err = str(e)
-            log.warning("cobalt %s: %s", base, e)
+            html = http_text("GET", page, headers={"Accept": "text/html,application/xhtml+xml"}, timeout=20)
+        except Exception as e:
+            log.warning("embed %s: %s", page, e)
             continue
-        status = str(data.get("status") or "")
-        if status == "error":
-            last_err = str((data.get("error") or {}).get("code") or data)
-            continue
-        file_url = data.get("url")
-        if status in {"redirect", "tunnel", "stream"} and file_url:
-            dest = workdir / "cobalt.bin"
-            if progress:
-                progress.set("download", 18, str(data.get("filename") or ""))
-            http_download(file_url, dest, progress=progress)
-            video = ensure_mp4(dest, workdir, progress)
-            return result_from_file(
-                video,
-                title=Path(str(data.get("filename") or "video")).stem,
-                author="video",
-                platform="tiktok" if "tiktok" in url.lower() else "instagram",
-                media_id=media_id_from_url(url, "tiktok" if "tiktok" in url.lower() else "instagram"),
-                webpage_url=url,
-            )
-        picker = data.get("picker") if isinstance(data.get("picker"), list) else []
-        videos = [p for p in picker if isinstance(p, dict) and p.get("url") and str(p.get("type") or "") != "photo"]
-        if videos:
-            dest = workdir / "cobalt.bin"
-            http_download(videos[0]["url"], dest, progress=progress)
-            video = ensure_mp4(dest, workdir, progress)
-            return result_from_file(
-                video,
-                title="Instagram",
-                author="Instagram",
-                platform="instagram",
-                media_id=media_id_from_url(url, "instagram"),
-                webpage_url=url,
-            )
-    if last_err:
-        log.warning("cobalt fail: %s", last_err)
-    return None
+        versions = re.findall(r'"video_versions"\s*:\s*(\[[^\]]+\])', html)
+        best = ""
+        best_w = -1
+        for blob in versions:
+            try:
+                items = json.loads(blob)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict) or not item.get("url"):
+                    continue
+                width = int(item.get("width") or 0)
+                if width >= best_w:
+                    best_w = width
+                    best = str(item["url"]).replace("\\u0026", "&")
+        if best:
+            video_url = best
+            break
+        og = re.findall(r'property="og:video(?::secure_url)?"\s+content="([^"]+)"', html)
+        if not og:
+            og = re.findall(r'content="(https:[^"]+\.mp4[^"]*)"', html)
+        if og:
+            video_url = og[0].replace("&amp;", "&")
+            break
+        mp4s = re.findall(r'https://[^"\\\s]+\.mp4[^"\\\s]*', html)
+        if mp4s:
+            video_url = max(mp4s, key=len).replace("\\u0026", "&").replace("\\/", "/")
+            break
+    if not video_url or looks_watermarked(video_url):
+        return None
+    workdir.mkdir(parents=True, exist_ok=True)
+    dest = workdir / "embed.bin"
+    if progress:
+        progress.set("download", 20)
+    download_remote_video(video_url, dest, progress=progress)
+    video = prepare_telegram_video(dest, workdir, progress)
+    return result_from_file(
+        video,
+        title="Instagram",
+        author="Instagram",
+        platform="instagram",
+        media_id=short,
+        webpage_url=url,
+    )
 
 
 def download_via_ytdlp(
@@ -2038,9 +2356,9 @@ def download_via_ytdlp(
 
     outtmpl = str(workdir / "ytdlp.%(ext)s")
     if platform == "tiktok":
-        fmt = "download/download_addr/h264_540p_1/best[ext=mp4]/best"
+        fmt = "download/download_addr/h264_720p_1/h264_540p_1/bestvideo*[vcodec^=avc1]+bestaudio/bestvideo+bestaudio/best"
     else:
-        fmt = "best[ext=mp4]/bestvideo*+bestaudio/best"
+        fmt = "bestvideo*+bestaudio/best"
     opts: dict[str, Any] = {
         "format": fmt,
         "outtmpl": {"default": outtmpl},
@@ -2050,12 +2368,13 @@ def download_via_ytdlp(
         "noprogress": True,
         "overwrites": True,
         "cachedir": False,
-        "retries": 1,
-        "fragment_retries": 2,
-        "extractor_retries": 1,
-        "socket_timeout": 15,
+        "retries": 2,
+        "fragment_retries": 5,
+        "extractor_retries": 2,
+        "socket_timeout": 20,
         "geo_bypass": True,
         "merge_output_format": "mp4",
+        "format_sort": ["res", "vbr", "abr"],
         "match_filter": match_filter,
     }
     cookie = cookies_file()
@@ -2077,12 +2396,24 @@ def download_via_ytdlp(
             if info.get("_type") == "playlist" and info.get("entries"):
                 info = next((e for e in info["entries"] if e), {}) or {}
     except (DownloadError, YoutubeDLError) as e:
-        log.warning("yt-dlp: %s", e)
-        raise RuntimeError(str(e)) from e
+        log.warning("yt-dlp high: %s", e)
+        if "ffmpeg" in str(e).lower() or "merging" in str(e).lower():
+            opts["format"] = "best[ext=mp4]/best"
+            opts.pop("merge_output_format", None)
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True) or {}
+                    if info.get("_type") == "playlist" and info.get("entries"):
+                        info = next((e for e in info["entries"] if e), {}) or {}
+            except (DownloadError, YoutubeDLError) as e2:
+                log.warning("yt-dlp: %s", e2)
+                raise RuntimeError(str(e2)) from e2
+        else:
+            raise RuntimeError(str(e)) from e
     video = find_file(workdir, {".mp4", ".webm", ".mkv", ".mov", ".m4v"})
     if not video:
         return None
-    video = ensure_mp4(video, workdir, progress)
+    video = prepare_telegram_video(video, workdir, progress)
     return result_from_file(
         video,
         title=(info.get("title") or platform).strip(),
@@ -2094,37 +2425,41 @@ def download_via_ytdlp(
     )
 
 
-def humanize_error(msg: str) -> str:
+def humanize_error(msg: str, platform: str = "") -> str:
     low = (msg or "").lower()
     if "too long" in low or "длиннее" in low:
         return f"Видео длиннее {MAX_DURATION_SEC // 60} минут."
     if "live" in low or "эфир" in low:
         return "Это прямой эфир — скачать нельзя."
-    if "login" in low or "cookies" in low or "not available" in low or "private" in low:
-        return "Ролик приватный или недоступен без входа. Попробуй публичную ссылку."
-    if "unavailable" in low or "removed" in low or "удалено" in low:
-        return "Это видео недоступно (удалено, приватное или заблокировано)."
-    if "photo" in low and "video" in low:
-        return "Это фото, не видео."
-    if "http error 403" in low or "blocked" in low:
-        return "Сервер временно не отдал файл. Попробуй ещё раз через минуту."
     if "слишком большой" in low:
         return msg
+    if "photo" in low and "video" in low:
+        return "Это фото, не видео."
+    if platform == "instagram" and any(s in low for s in ("login", "cookie", "private", "restricted", "not available")):
+        return (
+            "Instagram не отдал этот ролик. Пришли обычную публичную ссылку на Reel или пост "
+            "(не stories и не закрытый аккаунт) и попробуй ещё раз."
+        )
+    if "unavailable" in low or "removed" in low or "удалено" in low:
+        return "Это видео недоступно (удалено, приватное или заблокировано)."
+    if "http error 403" in low or "blocked" in low:
+        return "Сервер временно не отдал файл. Попробуй ещё раз через минуту."
     return "Не смог скачать это видео. Проверь ссылку и попробуй ещё раз."
 
 
 def download_video(url: str, platform: str, workdir: Path, progress: DownloadProgress | None = None) -> dict[str, Any]:
-    if platform == "tiktok" and any(p in url.lower() for p in ("vm.tiktok.com", "vt.tiktok.com", "tiktok.com/t/")):
-        url = resolve_redirect(url)
-        platform = "tiktok"
+    url = normalize_media_url(url, platform)
     last_err = ""
     backends: list[tuple[str, Any]] = []
     if platform == "tiktok":
         backends.append(("tikwm", lambda: download_via_tikwm(url, workdir / "tikwm", progress)))
-    backends.append(("cobalt", lambda: download_via_cobalt(url, workdir / "cobalt", progress)))
-    backends.append(("yt-dlp", lambda: download_via_ytdlp(url, platform, workdir / "ytdlp", progress)))
-    if platform == "instagram":
-        backends.append(("tikwm", lambda: download_via_tikwm(url, workdir / "tikwm2", progress)))
+        backends.append(("snapsave", lambda: download_via_snapsave(url, workdir / "snapsave", progress)))
+        backends.append(("yt-dlp", lambda: download_via_ytdlp(url, platform, workdir / "ytdlp", progress)))
+    else:
+        backends.append(("snapsave", lambda: download_via_snapsave(url, workdir / "snapsave", progress)))
+        backends.append(("embed", lambda: download_via_instagram_embed(url, workdir / "embed", progress)))
+        backends.append(("yt-dlp", lambda: download_via_ytdlp(url, platform, workdir / "ytdlp", progress)))
+        backends.append(("tikwm", lambda: download_via_tikwm(url, workdir / "tikwm", progress)))
 
     for name, fn in backends:
         dest = workdir / name
@@ -2132,7 +2467,7 @@ def download_video(url: str, platform: str, workdir: Path, progress: DownloadPro
         try:
             got = fn()
             if got and got.get("path") and Path(got["path"]).exists():
-                log.info("Скачал через %s: %s", name, got.get("title"))
+                log.info("Скачал через %s: %s %sx%s", name, got.get("title"), got.get("width"), got.get("height"))
                 return got
         except RuntimeError as e:
             last_err = str(e)
@@ -2142,7 +2477,7 @@ def download_video(url: str, platform: str, workdir: Path, progress: DownloadPro
         except Exception as e:
             last_err = str(e)
             log.warning("%s unexpected: %s", name, e)
-    raise RuntimeError(humanize_error(last_err) if last_err else "Не получилось скачать. Попробуй другую ссылку.")
+    raise RuntimeError(humanize_error(last_err, platform) if last_err else "Не получилось скачать. Попробуй другую ссылку.")
 
 
 async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2179,6 +2514,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     url, platform = found
+    url = normalize_media_url(url, platform)
     if not await ensure_subscribed(update, context):
         return
 
@@ -2221,7 +2557,7 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             dl_task = asyncio.create_task(asyncio.to_thread(download_video, url, platform, workdir, progress))
             last_text = ""
-            deadline = time.time() + 180
+            deadline = time.time() + 240
             while not dl_task.done():
                 if time.time() > deadline:
                     dl_task.cancel()
@@ -2241,10 +2577,14 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except BadRequest:
                 pass
 
-            video_path = Path(result["path"])
-            size_mb = video_path.stat().st_size / (1024 * 1024)
-            if size_mb > MAX_FILE_MB:
-                raise RuntimeError(f"Файл слишком большой ({size_mb:.0f} МБ). Лимит Telegram — {MAX_FILE_MB} МБ.")
+            video_path = fit_telegram_limit(Path(result["path"]), workdir, progress)
+            probe = probe_video(video_path)
+            if probe.get("width"):
+                result["width"] = probe["width"]
+            if probe.get("height"):
+                result["height"] = probe["height"]
+            if probe.get("duration") and not result.get("duration"):
+                result["duration"] = probe["duration"]
 
             caption = video_caption(result.get("title") or "Видео", result.get("author") or "", int(result.get("duration") or 0), settings)
             markup = ads_keyboard(settings) if (settings.get("ads") or {}).get("enabled_after_download") else None
